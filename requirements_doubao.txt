@@ -1,0 +1,17 @@
+# Core runtime
+transformers>=4.57.0
+torch
+torchvision
+accelerate
+gradio==5.49.1
+gradio_client==1.13.3
+
+# For multimodal image/video preprocessing
+qwen-vl-utils==0.0.14
+
+# PDF document support
+PyMuPDF>=1.24.0
+
+# URL image download
+requests
+Pillow

@@ -5,6 +5,7 @@
 import os
 import copy
 import re
+import queue
 from argparse import ArgumentParser
 from threading import Thread
 
@@ -226,7 +227,7 @@ def _launch_demo(args, model, processor, backend):
             )
 
             tokenizer = processor.tokenizer
-            streamer = TextIteratorStreamer(tokenizer, timeout=20.0, skip_prompt=True, skip_special_tokens=True)
+            streamer = TextIteratorStreamer(tokenizer, timeout=1.0, skip_prompt=True, skip_special_tokens=True)
 
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             gen_kwargs = {'max_new_tokens': 1024, 'streamer': streamer, **inputs}
@@ -234,9 +235,27 @@ def _launch_demo(args, model, processor, backend):
             thread.start()
 
             generated_text = ''
-            for new_text in streamer:
-                generated_text += new_text
-                yield generated_text
+            while thread.is_alive():
+                try:
+                    new_text = next(streamer)
+                except queue.Empty:
+                    continue
+                except StopIteration:
+                    break
+                else:
+                    generated_text += new_text
+                    yield generated_text
+
+            while True:
+                try:
+                    new_text = next(streamer)
+                except (queue.Empty, StopIteration):
+                    break
+                else:
+                    generated_text += new_text
+                    yield generated_text
+
+            thread.join()
 
     def create_predict_fn():
 
@@ -309,7 +328,7 @@ def _launch_demo(args, model, processor, backend):
         task_history = task_history if task_history is not None else []
         history = history + [(_parse_text(text), None)]
         task_history = task_history + [(task_text, None)]
-        return history, task_history, ''
+        return history, task_history
 
     def add_file(history, task_history, file):
         history = history if history is not None else []
