@@ -1,3 +1,7 @@
 __pycache__
 .gradio
 Qwen3-VL-2B-Instruct
+venv/
+*.pyc
+*.log
+tmp/
