@@ -26,6 +26,13 @@ try:
 except ImportError:
     HAS_QWEN_VL_UTILS = False
 
+try:
+    from vllm import LLM, SamplingParams
+
+    HAS_VLLM = True
+except ImportError:
+    HAS_VLLM = False
+
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".mpeg"}
 
@@ -260,7 +267,136 @@ class DoubaoAssistant:
         return _stream_tokens(), new_conversation
 
 
-def build_demo(assistant: DoubaoAssistant) -> gr.Blocks:
+class VllmDoubaoAssistant:
+    """使用 vLLM 后端进行推理的助手，接口与 DoubaoAssistant 兼容。"""
+
+    def __init__(self, model_path: str, max_new_tokens: int = 512,
+                 gpu_memory_utilization: float = 0.9, max_model_len: int = 8192):
+        if not HAS_VLLM:
+            raise RuntimeError("未安装 vllm，请先运行: pip install vllm")
+        self.model_path = model_path
+        self.max_new_tokens = max_new_tokens
+        self.llm = LLM(
+            model=model_path,
+            dtype="auto",
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            trust_remote_code=True,
+            limit_mm_per_prompt={"image": 10, "video": 2},
+            allowed_local_media_path="/",
+        )
+
+    @staticmethod
+    def _build_user_message(
+        text: str,
+        media_path: str | None,
+        extra_images: list[str] | None = None,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = []
+        if media_path:
+            if is_video(media_path):
+                content.append({"type": "video_url", "video_url": {"url": to_file_uri(media_path)}})
+            else:
+                content.append({"type": "image_url", "image_url": {"url": to_file_uri(media_path)}})
+
+        for img_path in (extra_images or []):
+            content.append({"type": "image_url", "image_url": {"url": to_file_uri(img_path)}})
+
+        if text.strip():
+            content.append({"type": "text", "text": text.strip()})
+
+        if not content:
+            raise ValueError("输入不能为空，请输入文本或上传图片/视频。")
+
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _to_openai_messages(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """将内部 conversation 格式统一为 OpenAI 兼容格式供 vLLM 使用。"""
+        result: list[dict[str, Any]] = []
+        for msg in conversation:
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                result.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                new_content: list[dict[str, Any]] = []
+                for item in content:
+                    if item.get("type") == "text":
+                        new_content.append({"type": "text", "text": item["text"]})
+                    elif item.get("type") == "image":
+                        new_content.append({"type": "image_url", "image_url": {"url": item["image"]}})
+                    elif item.get("type") == "image_url":
+                        new_content.append(item)
+                    elif item.get("type") == "video":
+                        new_content.append({"type": "video_url", "video_url": {"url": item["video"]}})
+                    elif item.get("type") == "video_url":
+                        new_content.append(item)
+                result.append({"role": role, "content": new_content})
+            else:
+                result.append({"role": role, "content": str(content)})
+        return result
+
+    def chat_stream(
+        self,
+        conversation: list[dict[str, Any]],
+        user_text: str,
+        media_path: str | None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        extra_images: list[str] | None = None,
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        new_conversation = copy.deepcopy(conversation)
+        user_message = self._build_user_message(user_text, media_path, extra_images=extra_images)
+        new_conversation.append(user_message)
+
+        openai_messages = self._to_openai_messages(new_conversation)
+
+        sampling_params = SamplingParams(
+            max_tokens=self.max_new_tokens,
+            temperature=temperature if temperature > 1e-5 else 0.0,
+            top_p=top_p,
+        )
+
+        import queue as _queue
+        q: _queue.Queue = _queue.Queue()
+        _DONE = object()
+
+        def _generate() -> None:
+            try:
+                outputs = self.llm.chat(openai_messages, sampling_params=sampling_params)
+                answer = outputs[0].outputs[0].text.strip()
+                q.put(("ok", answer))
+            except Exception as exc:  # noqa: BLE001
+                q.put(("err", exc))
+            finally:
+                q.put((_DONE, None))
+
+        worker = Thread(target=_generate, daemon=True)
+        worker.start()
+
+        def _stream_tokens():
+            dot_count = 0
+            while True:
+                try:
+                    tag, value = q.get(timeout=0.5)
+                except _queue.Empty:
+                    dot_count = (dot_count % 3) + 1
+                    yield f"\r{'.' * dot_count}"
+                    continue
+                if tag is _DONE:
+                    break
+                if tag == "err":
+                    raise value
+                answer = value
+                chunk_size = 8
+                for i in range(0, len(answer), chunk_size):
+                    yield answer[i : i + chunk_size]
+
+        return _stream_tokens(), new_conversation
+
+
+def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
     def submit(
         text: str,
         media_file: str | None,
@@ -316,6 +452,10 @@ def build_demo(assistant: DoubaoAssistant) -> gr.Blocks:
             )
             answer = ""
             for token in token_stream:
+                if token.startswith("\r"):
+                    chat_pairs[-1][1] = answer + token.lstrip("\r")
+                    yield "", None, None, "", chat_pairs, conversation
+                    continue
                 answer += token
                 chat_pairs[-1][1] = answer
                 yield "", None, None, "", chat_pairs, conversation
@@ -377,8 +517,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=str, default="./Qwen3-VL-2B-Instruct", help="Local model path or HF model id")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7861)
-    parser.add_argument("--cpu-only", action="store_true", help="Run on CPU only (slow)")
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--cpu-only", action="store_true", help="Run on CPU only (slow, transformers only)")
+    parser.add_argument("--max-new-tokens", type=int, default=16384)
+    parser.add_argument("--backend", type=str, default="transformers", choices=["transformers", "vllm"],
+                        help="Inference backend: 'transformers' or 'vllm'")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="GPU memory utilization for vLLM (0.0~1.0)")
+    parser.add_argument("--max-model-len", type=int, default=8192,
+                        help="Max sequence length for vLLM KV cache (default 8192, reduce if OOM)")
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--inbrowser", action="store_true")
     return parser.parse_args()
@@ -386,13 +532,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    device_map = "cpu" if args.cpu_only else "auto"
 
-    assistant = DoubaoAssistant(
-        model_path=args.model_path,
-        device_map=device_map,
-        max_new_tokens=args.max_new_tokens,
-    )
+    if args.backend == "vllm":
+        print(f"[启动] 使用 vLLM 后端加载模型: {args.model_path}")
+        assistant = VllmDoubaoAssistant(
+            model_path=args.model_path,
+            max_new_tokens=args.max_new_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+        )
+    else:
+        print(f"[启动] 使用 Transformers 后端加载模型: {args.model_path}")
+        device_map = "cpu" if args.cpu_only else "auto"
+        assistant = DoubaoAssistant(
+            model_path=args.model_path,
+            device_map=device_map,
+            max_new_tokens=args.max_new_tokens,
+        )
     app = build_demo(assistant)
     app.queue().launch(
         server_name=args.host,
