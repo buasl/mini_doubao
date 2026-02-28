@@ -149,12 +149,6 @@ python my_doubao_app.py \
 
 > 以下为项目运行效果，截图和录屏请自行替换。
 
-
-### 视频理解
-
-![视频理解截图](assets/demo_video.png)
-<!-- 替换为实际截图路径 -->
-
 ### 演示录屏
 
 ![演示录屏](assets/demo_recording.mp4)

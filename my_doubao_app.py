@@ -12,7 +12,7 @@ import psutil
 import requests
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor, TextIteratorStreamer
+from transformers import AutoModelForImageTextToText, AutoProcessor, TextIteratorStreamer, GenerationConfig
 
 try:
     import fitz as pymupdf  # PyMuPDF
@@ -136,6 +136,12 @@ class DoubaoAssistant:
             device_map=device_map,
         )
         self.processor = AutoProcessor.from_pretrained(model_path)
+        
+        # 加载生成配置，确保温度和采样参数被正确识别
+        try:
+            self.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception:
+            self.generation_config = self.model.generation_config
 
     def _estimate_text_tokens(self, conversation: list[dict[str, Any]]) -> int:
         """粗略估算对话的纯文本 token 数（不含视觉 token）。"""
@@ -312,10 +318,20 @@ class DoubaoAssistant:
                     max_new_tokens=self.max_new_tokens,
                     streamer=streamer,
                 )
+                # 配置生成参数
                 if temperature > 1e-5:
-                    gen_kwargs.update(do_sample=True, temperature=temperature, top_p=top_p)
+                    gen_kwargs.update(do_sample=True)
+                    # 使用 GenerationConfig 来配置采样参数
+                    gen_config = copy.deepcopy(self.generation_config)
+                    gen_config.temperature = temperature
+                    gen_config.top_p = top_p
+                    gen_config.do_sample = True
+                    gen_kwargs['generation_config'] = gen_config
                 else:
                     gen_kwargs.update(do_sample=False)
+                    gen_config = copy.deepcopy(self.generation_config)
+                    gen_config.do_sample = False
+                    gen_kwargs['generation_config'] = gen_config
                 self.model.generate(**gen_kwargs)
             except Exception as exc:  # noqa: BLE001
                 generation_error["error"] = exc
