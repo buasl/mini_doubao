@@ -3,10 +3,12 @@ import copy
 import os
 import io
 import tempfile
+import time
 from threading import Thread
 from typing import Any
 
 import gradio as gr
+import psutil
 import requests
 import torch
 from PIL import Image
@@ -43,6 +45,27 @@ def is_video(path: str) -> bool:
 
 def to_file_uri(path: str) -> str:
     return f"file://{os.path.abspath(path)}"
+
+
+def get_gpu_memory_nvidia_smi() -> dict[str, float]:
+    """通过 nvidia-smi 获取真实 GPU 显存使用情况（MB → GB），适用于 vLLM 等不走 PyTorch 分配器的场景。"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(",")
+            return {
+                "used_gb": round(int(parts[0].strip()) / 1024, 2),
+                "total_gb": round(int(parts[1].strip()) / 1024, 2),
+                "free_gb": round(int(parts[2].strip()) / 1024, 2),
+            }
+    except Exception:
+        pass
+    return {"used_gb": 0.0, "total_gb": 0.0, "free_gb": 0.0}
 
 
 def pdf_to_images(pdf_path: str, max_pages: int = 5) -> list[str]:
@@ -102,15 +125,50 @@ def url_to_image(url: str, timeout: int = 20) -> str:
 
 
 class DoubaoAssistant:
-    def __init__(self, model_path: str, device_map: str = "auto", max_new_tokens: int = 512):
+    def __init__(self, model_path: str, device_map: str = "auto", max_new_tokens: int = 512,
+                 max_context_tokens: int = 28000):
         self.model_path = model_path
         self.max_new_tokens = max_new_tokens
+        self.max_context_tokens = max_context_tokens  # 预留空间给生成
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path,
             torch_dtype="auto",
             device_map=device_map,
         )
         self.processor = AutoProcessor.from_pretrained(model_path)
+
+    def _estimate_text_tokens(self, conversation: list[dict[str, Any]]) -> int:
+        """粗略估算对话的纯文本 token 数（不含视觉 token）。"""
+        total_text = ""
+        for msg in conversation:
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                total_text += content
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        total_text += item.get("text", "")
+        try:
+            return len(self.processor.tokenizer.encode(total_text))
+        except Exception:
+            return len(total_text) // 2
+
+    def _trim_conversation(self, conversation: list[dict[str, Any]], keep_last_n: int = 4) -> list[dict[str, Any]]:
+        """裁剪对话历史以控制上下文长度。"""
+        if len(conversation) <= keep_last_n * 2 + 1:
+            return conversation
+        last_user = conversation[-1]
+        history = conversation[:-1]
+        keep_count = keep_last_n * 2
+        if len(history) <= keep_count:
+            return conversation
+        trimmed_history = history[-keep_count:]
+        dropped_count = len(history) - keep_count
+        summary_msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"[系统提示：为控制上下文长度，已省略前 {dropped_count} 条历史消息]"}],
+        }
+        return [summary_msg] + trimmed_history + [last_user]
 
     def _build_user_message(
         self,
@@ -229,6 +287,14 @@ class DoubaoAssistant:
         user_message = self._build_user_message(user_text, media_path, extra_images=extra_images)
         new_conversation.append(user_message)
 
+        # 自动裁剪上下文：如果纯文本 token 已经接近上限，逐步丢弃旧消息
+        est_tokens = self._estimate_text_tokens(new_conversation)
+        keep_n = 4
+        while est_tokens > self.max_context_tokens and keep_n >= 1:
+            new_conversation = self._trim_conversation(new_conversation, keep_last_n=keep_n)
+            est_tokens = self._estimate_text_tokens(new_conversation)
+            keep_n -= 1
+
         inputs = self._prepare_model_inputs(new_conversation)
         streamer = TextIteratorStreamer(
             tokenizer=self.processor.tokenizer,
@@ -271,11 +337,12 @@ class VllmDoubaoAssistant:
     """使用 vLLM 后端进行推理的助手，接口与 DoubaoAssistant 兼容。"""
 
     def __init__(self, model_path: str, max_new_tokens: int = 512,
-                 gpu_memory_utilization: float = 0.9, max_model_len: int = 8192):
+                 gpu_memory_utilization: float = 0.9, max_model_len: int = 32768):
         if not HAS_VLLM:
             raise RuntimeError("未安装 vllm，请先运行: pip install vllm")
         self.model_path = model_path
         self.max_new_tokens = max_new_tokens
+        self.max_model_len = max_model_len
         self.llm = LLM(
             model=model_path,
             dtype="auto",
@@ -337,6 +404,39 @@ class VllmDoubaoAssistant:
                 result.append({"role": role, "content": str(content)})
         return result
 
+    @staticmethod
+    def _trim_conversation(conversation: list[dict[str, Any]], keep_last_n: int = 2) -> list[dict[str, Any]]:
+        """裁剪对话历史，保留最后 keep_last_n 轮（每轮 = user + assistant），始终保留最后一条 user 消息。
+
+        策略：从前往后丢弃旧的 user/assistant 对，只保留纯文本的 assistant 摘要提示 + 最近的消息。
+        对于含有图片/视频的旧消息，媒体内容会被丢弃（因为无法重新编码）。
+        """
+        if len(conversation) <= keep_last_n * 2 + 1:
+            return conversation
+
+        # 最后一条一定是当前 user 消息，必须保留
+        last_user = conversation[-1]
+
+        # 前面的历史消息
+        history = conversation[:-1]
+
+        # 计算要保留的历史轮数（每轮 = user + assistant = 2 条）
+        # 保留最近的 keep_last_n 轮
+        keep_count = keep_last_n * 2
+        if len(history) <= keep_count:
+            return conversation
+
+        trimmed_history = history[-keep_count:]
+        dropped_count = len(history) - keep_count
+
+        # 添加一条系统提示说明上下文被裁剪了
+        summary_msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"[系统提示：为控制上下文长度，已省略前 {dropped_count} 条历史消息]"}],
+        }
+
+        return [summary_msg] + trimmed_history + [last_user]
+
     def chat_stream(
         self,
         conversation: list[dict[str, Any]],
@@ -350,8 +450,6 @@ class VllmDoubaoAssistant:
         user_message = self._build_user_message(user_text, media_path, extra_images=extra_images)
         new_conversation.append(user_message)
 
-        openai_messages = self._to_openai_messages(new_conversation)
-
         sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
             temperature=temperature if temperature > 1e-5 else 0.0,
@@ -363,14 +461,26 @@ class VllmDoubaoAssistant:
         _DONE = object()
 
         def _generate() -> None:
-            try:
-                outputs = self.llm.chat(openai_messages, sampling_params=sampling_params)
-                answer = outputs[0].outputs[0].text.strip()
-                q.put(("ok", answer))
-            except Exception as exc:  # noqa: BLE001
-                q.put(("err", exc))
-            finally:
-                q.put((_DONE, None))
+            conv_to_send = new_conversation
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    openai_messages = self._to_openai_messages(conv_to_send)
+                    outputs = self.llm.chat(openai_messages, sampling_params=sampling_params)
+                    answer = outputs[0].outputs[0].text.strip()
+                    q.put(("ok", answer))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    err_msg = str(exc)
+                    # 检测 prompt 过长错误，自动裁剪后重试
+                    if "longer than the maximum model length" in err_msg and attempt < max_retries - 1:
+                        keep_n = max(1, (max_retries - 1 - attempt))  # 逐步更激进地裁剪
+                        conv_to_send = self._trim_conversation(conv_to_send, keep_last_n=keep_n)
+                        q.put(("info", f"[上下文过长，自动裁剪历史并重试 ({attempt + 1}/{max_retries})...]"))
+                        continue
+                    q.put(("err", exc))
+                    break
+            q.put((_DONE, None))
 
         worker = Thread(target=_generate, daemon=True)
         worker.start()
@@ -386,6 +496,9 @@ class VllmDoubaoAssistant:
                     continue
                 if tag is _DONE:
                     break
+                if tag == "info":
+                    yield f"\r{value}"
+                    continue
                 if tag == "err":
                     raise value
                 answer = value
@@ -396,7 +509,33 @@ class VllmDoubaoAssistant:
         return _stream_tokens(), new_conversation
 
 
+def _get_perf_stats(use_nvidia_smi: bool = False) -> str:
+    """获取当前性能指标的格式化字符串。
+    use_nvidia_smi: vLLM 后端需要用 nvidia-smi 读取真实显存（vLLM 不走 PyTorch 分配器）。
+    """
+    lines = []
+    if torch.cuda.is_available():
+        if use_nvidia_smi:
+            gpu_mem = get_gpu_memory_nvidia_smi()
+            lines.append(f"🖥️ GPU: {torch.cuda.get_device_name(0)}")
+            lines.append(f"📊 显存: {gpu_mem['used_gb']:.2f} / {gpu_mem['total_gb']:.1f} GB (已用/总量)")
+            lines.append(f"📈 空闲: {gpu_mem['free_gb']:.2f} GB")
+        else:
+            alloc = torch.cuda.memory_allocated(0) / 1024**3
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            peak = torch.cuda.max_memory_allocated(0) / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            lines.append(f"🖥️ GPU: {torch.cuda.get_device_name(0)}")
+            lines.append(f"📊 显存: {alloc:.2f} / {total:.1f} GB (已分配/总量)")
+            lines.append(f"📈 峰值: {peak:.2f} GB | 预留: {reserved:.2f} GB")
+    mem = psutil.virtual_memory()
+    lines.append(f"💾 内存: {mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} GB ({mem.percent}%)")
+    lines.append(f"⚙️ CPU: {psutil.cpu_percent(interval=0.1)}%")
+    return "\n".join(lines)
+
+
 def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
+    is_vllm = isinstance(assistant, VllmDoubaoAssistant)
     def submit(
         text: str,
         media_file: str | None,
@@ -425,7 +564,7 @@ def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
                 media_tag += f"\n📄 PDF ({len(pdf_pages)} 页)"
             except Exception as exc:  # noqa: BLE001
                 chat_pairs.append(["", f"[PDF 处理失败] {exc}"])
-                yield "", None, None, "", chat_pairs, conversation
+                yield "", None, None, "", chat_pairs, conversation, ""
                 return
 
         image_url_str = (image_url or "").strip()
@@ -436,13 +575,23 @@ def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
                 media_tag += f"\n🔗 {image_url_str[:60]}"
             except Exception as exc:  # noqa: BLE001
                 chat_pairs.append(["", f"[URL 图片下载失败] {exc}"])
-                yield "", None, None, "", chat_pairs, conversation
+                yield "", None, None, "", chat_pairs, conversation, ""
                 return
 
         shown_user = (user_text.strip() if user_text.strip() else "[仅上传媒体]") + media_tag
 
         chat_pairs.append([shown_user, ""])
-        yield "", None, None, "", chat_pairs, conversation
+
+        # 性能计时开始
+        t_start = time.time()
+        first_token_time = None
+        token_count = 0
+        gpu_before_smi = get_gpu_memory_nvidia_smi()  # nvidia-smi 基线（对 vLLM 有效）
+        gpu_peak_smi = gpu_before_smi["used_gb"]
+        if torch.cuda.is_available() and not is_vllm:
+            torch.cuda.reset_peak_memory_stats()
+
+        yield "", None, None, "", chat_pairs, conversation, "⏳ 推理中..."
 
         try:
             token_stream, updated_conversation = assistant.chat_stream(
@@ -454,11 +603,28 @@ def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
             for token in token_stream:
                 if token.startswith("\r"):
                     chat_pairs[-1][1] = answer + token.lstrip("\r")
-                    yield "", None, None, "", chat_pairs, conversation
+                    elapsed = time.time() - t_start
+                    perf_text = f"⏳ 推理中... {elapsed:.1f}s"
+                    yield "", None, None, "", chat_pairs, conversation, perf_text
                     continue
+                if first_token_time is None:
+                    first_token_time = time.time()
+                token_count += 1
                 answer += token
                 chat_pairs[-1][1] = answer
-                yield "", None, None, "", chat_pairs, conversation
+
+                # 每 5 个 token 更新一次性能信息（vLLM 时同步采样 nvidia-smi 峰值）
+                if token_count % 5 == 0:
+                    if is_vllm:
+                        cur_smi = get_gpu_memory_nvidia_smi()
+                        gpu_peak_smi = max(gpu_peak_smi, cur_smi["used_gb"])
+                    elapsed = time.time() - t_start
+                    ttft = first_token_time - t_start if first_token_time else 0
+                    tps = token_count / (time.time() - first_token_time) if first_token_time and (time.time() - first_token_time) > 0 else 0
+                    perf_text = f"⏳ 推理中 | 耗时: {elapsed:.1f}s | 首token: {ttft:.2f}s | 速度: {tps:.1f} tok/s"
+                    yield "", None, None, "", chat_pairs, conversation, perf_text
+                else:
+                    yield "", None, None, "", chat_pairs, conversation, gr.update()
 
             answer = answer.strip()
             chat_pairs[-1][1] = answer
@@ -468,22 +634,58 @@ def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
                     "content": [{"type": "text", "text": answer}],
                 }
             )
-            yield "", None, None, "", chat_pairs, updated_conversation
+
+            # 最终性能统计
+            t_end = time.time()
+            total_time = t_end - t_start
+            ttft = (first_token_time - t_start) if first_token_time else total_time
+            tps = token_count / (t_end - first_token_time) if first_token_time and (t_end - first_token_time) > 0 else 0
+
+            perf_lines = [
+                f"✅ 推理完成",
+                f"⏱️ 总耗时: {total_time:.2f}s | 首token延迟: {ttft:.2f}s",
+                f"📝 生成 ~{token_count} tokens | 速度: {tps:.1f} tok/s",
+            ]
+            if torch.cuda.is_available():
+                if is_vllm:
+                    # vLLM 不走 PyTorch 分配器，用 nvidia-smi 读取真实显存
+                    gpu_after_smi = get_gpu_memory_nvidia_smi()
+                    gpu_peak_smi = max(gpu_peak_smi, gpu_after_smi["used_gb"])
+                    perf_lines.append(
+                        f"🖥️ GPU 显存: {gpu_after_smi['used_gb']:.2f} / {gpu_after_smi['total_gb']:.1f} GB"
+                    )
+                    perf_lines.append(
+                        f"📈 推理峰值: {gpu_peak_smi:.2f} GB (nvidia-smi)"
+                    )
+                else:
+                    peak_gb = torch.cuda.max_memory_allocated(0) / 1024**3
+                    alloc_gb = torch.cuda.memory_allocated(0) / 1024**3
+                    perf_lines.append(f"🖥️ GPU 峰值显存: {peak_gb:.2f} GB | 当前: {alloc_gb:.2f} GB")
+            mem = psutil.virtual_memory()
+            perf_lines.append(f"💾 系统内存: {mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} GB ({mem.percent}%)")
+
+            yield "", None, None, "", chat_pairs, updated_conversation, "\n".join(perf_lines)
         except Exception as exc:  # noqa: BLE001
             answer = f"[错误] {exc}"
             chat_pairs[-1][1] = answer
-            yield "", None, None, "", chat_pairs, conversation
+            yield "", None, None, "", chat_pairs, conversation, f"❌ 推理出错: {exc}"
 
     def clear_history():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return [], []
+        return [], [], ""
 
     with gr.Blocks(title="小豆包（Qwen3-VL）") as demo:
         gr.Markdown("## 小豆包（Qwen3-VL 本地多模态聊天）")
         gr.Markdown("支持：文本 / 图片 / 视频 / PDF 文档 / 图片URL 输入，多轮上下文对话。")
 
-        chatbot = gr.Chatbot(label="小豆包", height=520)
+        with gr.Row():
+            with gr.Column(scale=3):
+                chatbot = gr.Chatbot(label="小豆包", height=520)
+            with gr.Column(scale=1):
+                perf_display = gr.Textbox(label="📊 性能监控", lines=6, interactive=False,
+                                          value=_get_perf_stats(use_nvidia_smi=is_vllm))
+
         conversation_state = gr.State([])
 
         with gr.Row():
@@ -503,11 +705,11 @@ def build_demo(assistant: DoubaoAssistant | VllmDoubaoAssistant) -> gr.Blocks:
             clear_btn = gr.Button("清空会话")
 
         all_inputs = [text_input, media_input, pdf_input, url_input, chatbot, conversation_state, temperature_slider, top_p_slider]
-        all_outputs = [text_input, media_input, pdf_input, url_input, chatbot, conversation_state]
+        all_outputs = [text_input, media_input, pdf_input, url_input, chatbot, conversation_state, perf_display]
 
         send_btn.click(submit, inputs=all_inputs, outputs=all_outputs)
         text_input.submit(submit, inputs=all_inputs, outputs=all_outputs)
-        clear_btn.click(clear_history, outputs=[chatbot, conversation_state])
+        clear_btn.click(clear_history, outputs=[chatbot, conversation_state, perf_display])
 
     return demo
 
@@ -523,8 +725,8 @@ def parse_args() -> argparse.Namespace:
                         help="Inference backend: 'transformers' or 'vllm'")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                         help="GPU memory utilization for vLLM (0.0~1.0)")
-    parser.add_argument("--max-model-len", type=int, default=8192,
-                        help="Max sequence length for vLLM KV cache (default 8192, reduce if OOM)")
+    parser.add_argument("--max-model-len", type=int, default=32768,
+                        help="Max sequence length for vLLM KV cache (default 32768, reduce if OOM)")
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--inbrowser", action="store_true")
     return parser.parse_args()

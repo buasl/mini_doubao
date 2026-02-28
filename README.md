@@ -94,7 +94,6 @@ python my_doubao_app.py \
     --model-path ./Qwen3-VL-2B-Instruct \
     --backend vllm \
     --gpu-memory-utilization 0.9 \
-    --max-model-len 8192 \
     --host 0.0.0.0 \
     --port 7861
 ```
@@ -150,20 +149,6 @@ python my_doubao_app.py \
 
 > 以下为项目运行效果，截图和录屏请自行替换。
 
-### 聊天界面
-
-![聊天界面截图](assets/demo_chat.png)
-<!-- 替换为实际截图路径 -->
-
-### 图片理解
-
-![图片理解截图](assets/demo_image.png)
-<!-- 替换为实际截图路径 -->
-
-### PDF 文档解析
-
-![PDF 解析截图](assets/demo_pdf.png)
-<!-- 替换为实际截图路径 -->
 
 ### 视频理解
 
@@ -172,7 +157,7 @@ python my_doubao_app.py \
 
 ### 演示录屏
 
-![演示录屏](assets/demo_recording.gif)
+![演示录屏](assets/demo_recording.mp4)
 <!-- 替换为实际录屏 GIF 或视频链接 -->
 
 ---
@@ -232,7 +217,8 @@ python my_doubao_app.py \
 | **视频长度** | 受显存和 `max_model_len` 限制，建议视频不超过 30 秒 |
 | **并发能力** | 单用户单请求，不支持多用户并发推理 |
 | **vLLM 流式** | vLLM 后端为"伪流式"（整体生成后分块输出），非逐 token 流式 |
+| **vLLM 显存监控** | 修复了之前显示 0 的问题，现通过 nvidia-smi 报告实际使用 |
 | **URL 图片** | 仅支持直链图片 URL，不支持需要登录或 JS 渲染的页面 |
-| **多轮上下文** | 历史消息全部拼接，超长对话可能触发 OOM 或被截断 |
+| **多轮上下文** | 历史消息全部拼接，超长对话可能触发 OOM 或被截断。已新增自动裁剪逻辑，超过长度时会删除最早的轮次并插入系统提示 |
 | **CPU 模式** | 仅 Transformers 后端支持 `--cpu-only`，速度极慢，仅供调试 |
 | **模型能力** | 2B 参数量为轻量版，复杂推理和长文本生成能力弱于更大模型 |
